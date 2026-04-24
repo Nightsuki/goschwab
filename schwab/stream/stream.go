@@ -477,6 +477,10 @@ func (s *Streamer) connectAndLogin(ctx context.Context) error {
 	if err != nil {
 		return &schwab.StreamError{Op: "connect", Err: err}
 	}
+	// Schwab's first snapshot frame after SUBS can be several hundred KB when
+	// subscribing to a large symbol set; nhooyr's 32 KB default trips that.
+	// Bump generously — 16 MB matches Schwab's own documented frame ceiling.
+	conn.SetReadLimit(16 * 1024 * 1024)
 
 	// 3) send LOGIN.
 	token, err := s.client.CurrentToken(ctx)
