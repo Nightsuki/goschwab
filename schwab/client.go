@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // Client is the Schwab REST client. Safe for concurrent use.
@@ -32,6 +34,12 @@ type Client struct {
 
 	mu    sync.Mutex
 	token *Token
+
+	// refreshGroup deduplicates concurrent refresh attempts within this Client.
+	// The key is a literal "refresh"; the Group is per-Client so dedup is
+	// scoped to this instance. If Group is ever promoted to package scope,
+	// the key must include c.appKey to avoid cross-Client collisions.
+	refreshGroup singleflight.Group
 }
 
 // DefaultTimeout is the default per-request timeout.

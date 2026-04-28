@@ -170,7 +170,45 @@ func (c *Client) ForceRefresh(ctx context.Context) error {
 }
 
 // doRefresh exchanges the current refresh token for a new access token.
+//
+// Concurrent callers within the same Client are deduplicated via singleflight:
+// only one HTTP refresh is in flight at a time, and all callers observe the
+// same outcome. Before issuing the request, the token store is re-loaded so
+// that a peer process which has already rotated the refresh token cannot
+// cause this client to send a stale (and thus rejected) refresh_token.
 func (c *Client) doRefresh(ctx context.Context) error {
+	_, err, _ := c.refreshGroup.Do("refresh", func() (any, error) {
+		return nil, c.doRefreshLocked(ctx)
+	})
+	return err
+}
+
+// doRefreshLocked is the body of doRefresh; it runs at most once concurrently
+// per Client thanks to the singleflight wrapper above.
+func (c *Client) doRefreshLocked(ctx context.Context) error {
+	// Re-Load the store first: a peer process sharing this store may have
+	// already rotated the token, in which case our in-memory copy holds a
+	// refresh_token that Schwab has revoked. Adopt the store's version when
+	// its access_token differs from ours — using AccessToken as the freshness
+	// signal because Schwab does not always rotate refresh_token, so
+	// RefreshTokenIssued is not a reliable monotonic clock.
+	if loaded, lerr := c.cfg.tokenStore.Load(ctx); lerr == nil && loaded != nil {
+		c.mu.Lock()
+		adopted := c.token == nil || loaded.AccessToken != c.token.AccessToken
+		if adopted {
+			c.token = loaded
+			// Double-check: only short-circuit when we adopted a *different*
+			// fresh token from the store (peer just refreshed for us). If the
+			// store still holds the same token we had, the caller knows it is
+			// bad (e.g. 401 path) — proceed with HTTP refresh.
+			if c.token.AccessTokenRemaining() >= accessTokenRefreshThreshold {
+				c.mu.Unlock()
+				return nil
+			}
+		}
+		c.mu.Unlock()
+	}
+
 	c.mu.Lock()
 	tok := c.token
 	c.mu.Unlock()

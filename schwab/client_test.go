@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -314,5 +315,146 @@ func TestDo_GenericAPIError(t *testing.T) {
 	}
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatal("errors.Is(ErrNotFound) should match")
+	}
+}
+
+// TestDoRefresh_SingleflightDeduplicates verifies that N goroutines calling
+// doRefresh concurrently produce exactly one HTTP refresh request — the
+// singleflight wrapper collapses the rest. Without singleflight every caller
+// would race to send the same refresh_token, and only the first would succeed
+// (Schwab rotates refresh tokens on every grant).
+func TestDoRefresh_SingleflightDeduplicates(t *testing.T) {
+	ctx := context.Background()
+	var tokenCalls int32
+	gate := make(chan struct{})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/oauth/token", func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&tokenCalls, 1)
+		// Block long enough for all goroutines to pile up behind the first.
+		<-gate
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "FRESH",
+			"refresh_token": "RT2",
+			"token_type":    "Bearer",
+			"expires_in":    1800,
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	store := NewMemoryTokenStore()
+	now := time.Now().UTC()
+	if err := store.Save(ctx, &Token{
+		AccessToken:        "OLD",
+		RefreshToken:       "RT",
+		ExpiresIn:          1800,
+		AccessTokenIssued:  now,
+		RefreshTokenIssued: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewClient(ctx, testAppKey32, testAppSecret16,
+		WithCallbackURL(validCallback),
+		WithTokenStore(store),
+		WithBaseURL(srv.URL),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	const n = 16
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = c.doRefresh(ctx)
+		}(i)
+	}
+	// Give goroutines a moment to enter singleflight.Do and queue up.
+	time.Sleep(50 * time.Millisecond)
+	close(gate)
+	wg.Wait()
+
+	for i, e := range errs {
+		if e != nil {
+			t.Fatalf("goroutine %d: %v", i, e)
+		}
+	}
+	if got := atomic.LoadInt32(&tokenCalls); got != 1 {
+		t.Fatalf("token endpoint hits: got %d want 1", got)
+	}
+	if c.AccessToken() != "FRESH" {
+		t.Fatalf("post-refresh access token: %q want FRESH", c.AccessToken())
+	}
+}
+
+// TestDoRefresh_AdoptsPeerRotatedToken verifies that if the token store has
+// already been updated by another process (its access token differs from the
+// in-memory copy and is still fresh), doRefresh adopts the store's token and
+// skips the HTTP refresh entirely.
+func TestDoRefresh_AdoptsPeerRotatedToken(t *testing.T) {
+	ctx := context.Background()
+	var tokenCalls int32
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/oauth/token", func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&tokenCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "SHOULD_NOT_HIT",
+			"token_type":   "Bearer",
+			"expires_in":   1800,
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	store := NewMemoryTokenStore()
+	now := time.Now().UTC()
+	// Initial token: what NewClient will load.
+	if err := store.Save(ctx, &Token{
+		AccessToken:        "OLD",
+		RefreshToken:       "RT",
+		ExpiresIn:          1800,
+		AccessTokenIssued:  now,
+		RefreshTokenIssued: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewClient(ctx, testAppKey32, testAppSecret16,
+		WithCallbackURL(validCallback),
+		WithTokenStore(store),
+		WithBaseURL(srv.URL),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	// Simulate a peer process rotating the token: write a fresh, different
+	// token to the store *after* NewClient cached "OLD" in memory.
+	if err := store.Save(ctx, &Token{
+		AccessToken:        "PEER_ROTATED",
+		RefreshToken:       "RT2",
+		ExpiresIn:          1800,
+		AccessTokenIssued:  time.Now().UTC(),
+		RefreshTokenIssued: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.doRefresh(ctx); err != nil {
+		t.Fatalf("doRefresh: %v", err)
+	}
+	if got := atomic.LoadInt32(&tokenCalls); got != 0 {
+		t.Fatalf("token endpoint should not be hit; got %d", got)
+	}
+	if c.AccessToken() != "PEER_ROTATED" {
+		t.Fatalf("expected peer-rotated token, got %q", c.AccessToken())
 	}
 }
