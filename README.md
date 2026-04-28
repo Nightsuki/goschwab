@@ -9,6 +9,7 @@ A Go client for the Charles Schwab Trader API and Market Data API, ported from [
 
 - **OAuth2 3-legged flow** — automatic token refresh with browser-based authorization
 - **Pluggable token storage** — JSON file (default) or custom backend; optional AES-256-GCM encryption at rest
+- **Concurrent-safe refresh** — singleflight deduplication in-process; optional `TokenStoreLocker` interface for cross-process coordination (POSIX flock built into the file store on Unix)
 - **Full REST parity** — complete market data and trading endpoint coverage
 - **Resilient WebSocket streamer** — automatic reconnection with exponential backoff and subscription replay
 - **Idiomatic Go** — context-aware, `errors.Is/As` error handling, concurrent-safe client
@@ -100,6 +101,31 @@ c, err := schwab.NewClient(
 	schwab.WithEncryptionKey(encryptionKey),
 )
 ```
+
+### Multi-Process Deployments
+
+If several processes share the same `TokenStore` (a shared file path, a Redis-backed implementation, etc.), refreshes need to be coordinated across processes — otherwise two peers may simultaneously consume the same `refresh_token` and one will fail with `invalid_grant` (Schwab rotates the refresh token on every grant).
+
+goschwab handles this with the optional `TokenStoreLocker` interface:
+
+```go
+type TokenStoreLocker interface {
+    AcquireRefreshLock(ctx context.Context) (release func(), err error)
+}
+```
+
+**Built-in support:** `NewFileTokenStore` implements `TokenStoreLocker` on Unix using POSIX `flock` on a sibling `<path>.lock` file. Multiple processes pointing at the same token file automatically serialize refreshes — no extra configuration required.
+
+**External stores:** Backends like Redis, Consul, etcd, or a SQL advisory lock can opt in by implementing the interface. Stores that don't implement it still work; in that case refreshes are only deduplicated within each process (occasional `invalid_grant` losses on peer rotation are recoverable on the next refresh cycle).
+
+Implementation contract (documented on the interface):
+
+- `AcquireRefreshLock` blocks until the lock is acquired or `ctx` expires.
+- TTL must exceed the refresh HTTP timeout so a crashed peer doesn't deadlock survivors.
+- The returned `release` is idempotent and safe to call from multiple goroutines.
+- `ctx` errors propagate verbatim so callers can distinguish lock-wait timeouts from auth failures.
+
+In-process, refreshes are always deduplicated via `singleflight` regardless of store type — N concurrent goroutines triggering an expired-token refresh produce exactly one HTTP call and share the result.
 
 ### Headless / Custom Authorization
 

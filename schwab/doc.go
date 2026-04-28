@@ -52,6 +52,25 @@
 //		WithAuthorizer(myCustomAuthorizer),
 //	)
 //
+// # Concurrent-safe Refresh
+//
+// Refresh attempts are deduplicated within a single Client via singleflight,
+// so concurrent goroutines hitting an expired access token issue at most one
+// HTTP refresh and share the result. Before each refresh the token store is
+// re-loaded so a peer process that has already rotated the token is observed
+// and its rotated value adopted (avoiding invalid_grant on a revoked
+// refresh_token).
+//
+// # Multi-process Deployments
+//
+// When several processes share the same TokenStore (e.g. a shared file, a
+// Redis-backed store) the optional [TokenStoreLocker] interface coordinates
+// refreshes across processes. The bundled [NewFileTokenStore] satisfies it
+// on Unix via POSIX flock; external stores (Redis, Consul, etcd, etc.) can
+// implement it themselves to participate. Stores that do not implement
+// [TokenStoreLocker] still work — refresh is then only deduplicated within
+// each process.
+//
 // # Error Handling
 //
 // Use [errors.Is] and [errors.As] to inspect errors:
