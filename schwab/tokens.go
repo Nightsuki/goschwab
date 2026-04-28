@@ -96,6 +96,33 @@ type TokenStore interface {
 	Close() error
 }
 
+// TokenStoreLocker is an optional interface that a TokenStore MAY implement
+// to coordinate refresh attempts across multiple processes sharing the same
+// store. When the configured TokenStore satisfies this interface, the Client
+// acquires the lock before issuing a refresh-token request, ensuring at most
+// one process performs the rotation while peers wait and re-Load the result.
+//
+// The bundled NewFileTokenStore satisfies this interface on Unix (via POSIX
+// flock on a sibling .lock file). External stores backed by Redis, Consul,
+// etcd, etc. should provide their own implementation following these rules:
+//
+//   - AcquireRefreshLock blocks until the lock is acquired or ctx expires.
+//   - Implementations SHOULD use a TTL strictly greater than the refresh
+//     HTTP timeout, so a crashed peer does not deadlock survivors.
+//   - The returned release func MUST be idempotent and MUST NOT panic on
+//     repeated invocation.
+//   - ctx errors MUST be returned verbatim (e.g. context.DeadlineExceeded)
+//     so callers can distinguish lock contention from auth failures.
+//
+// Stores that do not implement TokenStoreLocker still work — the Client
+// simply skips the lock step. In that mode, multi-process deployments may
+// observe duplicate refresh-token rotations and benign invalid_grant errors
+// on the losers (which Schwab returns when a refresh_token is consumed by
+// a sibling process).
+type TokenStoreLocker interface {
+	AcquireRefreshLock(ctx context.Context) (release func(), err error)
+}
+
 // ------------------------------------------------------------------
 // Memory token store
 // ------------------------------------------------------------------

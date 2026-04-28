@@ -186,6 +186,18 @@ func (c *Client) doRefresh(ctx context.Context) error {
 // doRefreshLocked is the body of doRefresh; it runs at most once concurrently
 // per Client thanks to the singleflight wrapper above.
 func (c *Client) doRefreshLocked(ctx context.Context) error {
+	// If the store implements TokenStoreLocker, acquire the cross-process
+	// lock before reading or refreshing. This serializes refresh attempts
+	// across peer processes sharing the store. ctx errors propagate verbatim
+	// so callers can distinguish lock-wait timeouts from auth failures.
+	if locker, ok := c.cfg.tokenStore.(TokenStoreLocker); ok {
+		release, err := locker.AcquireRefreshLock(ctx)
+		if err != nil {
+			return err
+		}
+		defer release()
+	}
+
 	// Re-Load the store first: a peer process sharing this store may have
 	// already rotated the token, in which case our in-memory copy holds a
 	// refresh_token that Schwab has revoked. Adopt the store's version when

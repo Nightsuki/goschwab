@@ -393,6 +393,116 @@ func TestDoRefresh_SingleflightDeduplicates(t *testing.T) {
 	}
 }
 
+// lockingMemoryStore wraps memoryTokenStore with a TokenStoreLocker
+// implementation backed by a hook so tests can inject behavior.
+type lockingMemoryStore struct {
+	TokenStore
+	acquireCalls int32
+	releaseCalls int32
+	acquire      func(ctx context.Context) (func(), error)
+}
+
+func (l *lockingMemoryStore) AcquireRefreshLock(ctx context.Context) (func(), error) {
+	atomic.AddInt32(&l.acquireCalls, 1)
+	if l.acquire != nil {
+		return l.acquire(ctx)
+	}
+	return func() { atomic.AddInt32(&l.releaseCalls, 1) }, nil
+}
+
+// TestDoRefresh_AcquiresLockerWhenImplemented verifies that doRefresh
+// invokes AcquireRefreshLock exactly once per refresh and that the returned
+// release func is invoked when refresh completes.
+func TestDoRefresh_AcquiresLockerWhenImplemented(t *testing.T) {
+	ctx := context.Background()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/oauth/token", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "FRESH",
+			"token_type":   "Bearer",
+			"expires_in":   1800,
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	inner := NewMemoryTokenStore()
+	now := time.Now().UTC()
+	if err := inner.Save(ctx, &Token{
+		AccessToken: "OLD", RefreshToken: "RT", ExpiresIn: 1800,
+		AccessTokenIssued: now, RefreshTokenIssued: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := &lockingMemoryStore{TokenStore: inner}
+
+	c, err := NewClient(ctx, testAppKey32, testAppSecret16,
+		WithCallbackURL(validCallback),
+		WithTokenStore(store),
+		WithBaseURL(srv.URL),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	if err := c.doRefresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&store.acquireCalls); got != 1 {
+		t.Fatalf("AcquireRefreshLock calls: got %d want 1", got)
+	}
+	if got := atomic.LoadInt32(&store.releaseCalls); got != 1 {
+		t.Fatalf("release calls: got %d want 1", got)
+	}
+}
+
+// TestDoRefresh_LockerCtxErrorPropagates verifies that a ctx error returned
+// by AcquireRefreshLock is propagated verbatim (not wrapped in AuthError).
+func TestDoRefresh_LockerCtxErrorPropagates(t *testing.T) {
+	ctx := context.Background()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/oauth/token", func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("token endpoint should not be reached when lock acquisition fails")
+		http.Error(w, "should not happen", http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	inner := NewMemoryTokenStore()
+	now := time.Now().UTC()
+	_ = inner.Save(ctx, &Token{
+		AccessToken: "OLD", RefreshToken: "RT", ExpiresIn: 1800,
+		AccessTokenIssued: now, RefreshTokenIssued: now,
+	})
+	store := &lockingMemoryStore{
+		TokenStore: inner,
+		acquire: func(_ context.Context) (func(), error) {
+			return nil, context.DeadlineExceeded
+		},
+	}
+
+	c, err := NewClient(ctx, testAppKey32, testAppSecret16,
+		WithCallbackURL(validCallback),
+		WithTokenStore(store),
+		WithBaseURL(srv.URL),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	err = c.doRefresh(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected ctx.DeadlineExceeded verbatim, got %v (%T)", err, err)
+	}
+	var ae *AuthError
+	if errors.As(err, &ae) {
+		t.Fatal("ctx error must not be wrapped as *AuthError")
+	}
+}
+
 // TestDoRefresh_AdoptsPeerRotatedToken verifies that if the token store has
 // already been updated by another process (its access token differs from the
 // in-memory copy and is still fresh), doRefresh adopts the store's token and
