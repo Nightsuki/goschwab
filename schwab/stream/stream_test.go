@@ -474,6 +474,40 @@ func TestServerCleanCloseReconnects(t *testing.T) {
 	}
 }
 
+func TestDoneClosesOnStop(t *testing.T) {
+	s, fake := newStreamer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-fake.loggedIn:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received LOGIN")
+	}
+
+	done := s.Done()
+	if done == nil {
+		t.Fatal("Done() = nil after Start")
+	}
+	select {
+	case <-done:
+		t.Fatal("Done closed while streamer is running")
+	default:
+	}
+
+	if err := s.Stop(context.Background(), true); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	select {
+	case <-done:
+		// closed — permanent stop is observable.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Done not closed after Stop")
+	}
+}
+
 func TestSendWhileInactiveQueuesAndDrains(t *testing.T) {
 	wsURL, fake, _ := startFake(t)
 	c := newTestRESTClient(t, wsURL)

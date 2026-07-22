@@ -174,6 +174,17 @@ func (s *Streamer) Active() bool {
 }
 
 // Subscriptions returns a deep copy of the current subscription state.
+// Done returns a channel that is closed once the streamer has permanently
+// stopped: after Stop(), context cancellation, or a supervisor bail-out
+// (e.g. repeated unstable connections). Callers that must not keep running
+// without a live stream should watch this channel and restart or exit.
+// Returns nil before Start.
+func (s *Streamer) Done() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.doneCh
+}
+
 func (s *Streamer) Subscriptions() map[Service]map[string][]string {
 	return s.subs.snapshot()
 }
