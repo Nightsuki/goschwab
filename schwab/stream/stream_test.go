@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,6 +39,10 @@ type fakeStreamer struct {
 	// closeAfter, when set, closes the connection abnormally after the LOGIN
 	// reply instead of reading further frames. Test-only knob.
 	closeAbnormallyAfterLogin bool
+	// closeCleanlyOnNextFrame, when set, closes the connection with
+	// StatusNormalClosure right after the next recorded frame — mimics
+	// Schwab's server-side session close. One-shot: consumed on use.
+	closeCleanlyOnNextFrame bool
 
 	// loggedIn is closed once a successful LOGIN ack has been written.
 	loggedIn chan struct{}
@@ -112,7 +117,13 @@ func (f *fakeStreamer) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		f.mu.Lock()
 		f.received = append(f.received, e.Requests...)
+		closeClean := f.closeCleanlyOnNextFrame
+		f.closeCleanlyOnNextFrame = false
 		f.mu.Unlock()
+		if closeClean {
+			_ = conn.Close(websocket.StatusNormalClosure, "session closed")
+			return
+		}
 	}
 }
 
@@ -408,6 +419,58 @@ func TestAbruptCloseOverThresholdReconnects(t *testing.T) {
 	// Active() remains true.
 	if !s.Active() {
 		t.Error("Active() should remain true during normal operation")
+	}
+}
+
+func TestServerCleanCloseReconnects(t *testing.T) {
+	// A NormalClosure from the server after a stable uptime must trigger a
+	// reconnect — only a local Stop() is terminal. Regression for
+	// 2026-07-17: Schwab's clean close was treated as terminal and the
+	// streamer stayed dead until a process restart.
+	wsURL, fake, _ := startFake(t)
+	c := newTestRESTClient(t, wsURL)
+	s := stream.New(c, stream.WithInitialBackoff(50*time.Millisecond), stream.WithMaxBackoff(100*time.Millisecond))
+	stream.SetStreamerURLForTest(s, wsURL)
+
+	// connectedAt is stamped via nowFn too, so a fixed offset would make
+	// uptime zero. Shift the clock only after the connection is up: uptime
+	// then reads as 200s and the clean close is evaluated as a
+	// stable-connection drop, not an unstable-window bail.
+	var shifted atomic.Bool
+	base := time.Now()
+	stream.SetNowForTest(s, func() time.Time {
+		if shifted.Load() {
+			return base.Add(200 * time.Second)
+		}
+		return base
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Stop(context.Background(), true) })
+
+	// Arm: next recorded frame gets a clean close; the session after it is
+	// normal. Swap loggedIn first so the reconnect is observable.
+	relogin := make(chan struct{})
+	fake.mu.Lock()
+	fake.loggedIn = relogin
+	fake.closeCleanlyOnNextFrame = true
+	fake.mu.Unlock()
+	shifted.Store(true)
+
+	// This ADD frame triggers the server-side clean close.
+	if err := s.Subscribe(ctx, stream.LevelOneEquities, []string{"AMD"}, []string{"0", "1"}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	select {
+	case <-relogin:
+		// Reconnected and logged in again — clean close was not terminal.
+	case <-time.After(3 * time.Second):
+		t.Fatal("streamer did not reconnect after server clean close")
 	}
 }
 

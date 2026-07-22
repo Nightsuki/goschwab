@@ -628,13 +628,14 @@ func (s *Streamer) supervise(ctx context.Context) {
 			return
 		}
 
-		// Evaluate close status for reconnect decision.
+		// Evaluate close status for reconnect decision. A normal closure
+		// from the server (nightly maintenance, session rotation) still
+		// needs a reconnect — only a local Stop() (checked above via
+		// s.stopped) is terminal. The unstable-window bail below is what
+		// keeps two same-account sessions from displacing each other in an
+		// endless reconnect loop.
 		var ce websocket.CloseError
 		cleanClose := errors.As(closeErr, &ce) && ce.Code == websocket.StatusNormalClosure
-		if cleanClose {
-			s.cfg.logger.Info("schwab: stream closed cleanly; not reconnecting")
-			return
-		}
 
 		uptime := s.nowFn().Sub(connectedAt)
 		if uptime < stableConnectionThreshold {
@@ -645,9 +646,14 @@ func (s *Streamer) supervise(ctx context.Context) {
 		}
 
 		delay := s.bo.Next()
-		s.cfg.logger.Warn("schwab: stream dropped; reconnecting",
-			slog.Duration("backoff", delay),
-			slog.Any("error", closeErr))
+		if cleanClose {
+			s.cfg.logger.Info("schwab: stream closed cleanly by server; reconnecting",
+				slog.Duration("backoff", delay))
+		} else {
+			s.cfg.logger.Warn("schwab: stream dropped; reconnecting",
+				slog.Duration("backoff", delay),
+				slog.Any("error", closeErr))
+		}
 		select {
 		case <-ctx.Done():
 			return
